@@ -2,3 +2,4 @@ openai-agents
 openai
 python-dotenv
 bs4
+tiktoken

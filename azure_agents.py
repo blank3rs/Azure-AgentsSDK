@@ -12,6 +12,7 @@ import json
 import requests  # Add this import for web search
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
+import tiktoken  # Add tiktoken for token counting
 
 from dotenv import load_dotenv
 from openai import AsyncAzureOpenAI
@@ -57,6 +58,435 @@ load_dotenv()
 # Disable tracing to avoid errors
 set_tracing_disabled(True)
 
+# Base context class for Azure Agents
+class BaseContext:
+    """
+    Base context class for Azure Agents with built-in functionality for conversation history,
+    handoffs tracking, and metadata storage.
+    
+    This provides a standard way to maintain state between agent runs and
+    track important events like handoffs between agents.
+    
+    Example:
+    ```python
+    # Create a simple context
+    context = BaseContext()
+    
+    # Run an agent with the context
+    with agent_context(context) as ctx:
+        result = run(agent, "Hello", ctx)
+    
+    # Access the conversation history
+    for query, response in context.get_history():
+        print(f"Q: {query}\nA: {response}\n")
+    ```
+    
+    You can also extend this class to add custom functionality:
+    ```python
+    class MyCustomContext(BaseContext):
+        def __init__(self):
+            super().__init__()
+            self.custom_data = {}
+            
+        def add_custom_data(self, key, value):
+            self.custom_data[key] = value
+    ```
+    """
+    def __init__(self, max_tokens: int = 30000, tokenizer_name: str = "cl100k_base", 
+                 auto_summarize: bool = True, summarization_model: Optional[str] = None):
+        """
+        Initialize a new context instance.
+        
+        Args:
+            max_tokens: Maximum number of tokens to maintain before summarization (default: 30000)
+            tokenizer_name: Name of the tokenizer to use for counting tokens (default: cl100k_base for GPT-4)
+            auto_summarize: Whether to automatically summarize conversation history when token limit is approached
+            summarization_model: Optional model name to use for summarization (defaults to same as agent)
+        """
+        self.history = []  # Conversation history (query, response) tuples
+        self.handoffs = []  # Agent handoffs (from_agent, to_agent) tuples
+        self.metadata = {}  # General purpose metadata storage
+        self.tool_executions = []  # Track tool executions
+        self.session_start = datetime.datetime.now()
+        
+        # Token management
+        self.max_tokens = max_tokens
+        self.current_token_count = 0
+        self.tokenizer_name = tokenizer_name
+        self.tokenizer = tiktoken.get_encoding(tokenizer_name)
+        self.auto_summarize = auto_summarize
+        self.summarization_model = summarization_model
+        self.summaries = []  # Store historical summaries
+    
+    def add_to_history(self, query: str, response: str) -> None:
+        """
+        Add a query-response pair to the conversation history.
+        
+        Args:
+            query: The user query/input
+            response: The agent's response
+        """
+        timestamp = datetime.datetime.now()
+        
+        # Calculate tokens for this exchange
+        query_tokens = len(self.tokenizer.encode(query))
+        response_tokens = len(self.tokenizer.encode(response))
+        exchange_tokens = query_tokens + response_tokens
+        
+        # Add to history in a format that's compatible with message contexts
+        exchange = {
+            "timestamp": timestamp,
+            "query": query,
+            "response": response,
+            "tokens": exchange_tokens,
+            "role_format": [
+                {"role": "user", "content": query},
+                {"role": "assistant", "content": response}
+            ]
+        }
+        self.history.append(exchange)
+        
+        # Log that we're adding to history
+        logger.info(f"Added to conversation history: Q: '{query[:30]}...' A: '{response[:30]}...'")
+        
+        # Update token count
+        self.current_token_count += exchange_tokens
+        
+        # Check if we need to summarize
+        if self.auto_summarize and self.current_token_count > self.max_tokens * 0.8:
+            self._summarize_history()
+    
+    def _summarize_history(self) -> None:
+        """
+        Summarize the conversation history when it gets too large.
+        This preserves the most recent exchanges while summarizing older ones.
+        """
+        if not self.history or len(self.history) < 3:
+            return  # Not enough history to summarize
+        
+        logger.info(f"Summarizing conversation history. Current token count: {self.current_token_count}")
+        
+        # Keep the most recent exchanges (about 20% of max tokens)
+        tokens_to_keep = int(self.max_tokens * 0.2)
+        recent_exchanges = []
+        tokens_in_recent = 0
+        
+        # Work backwards to keep the most recent exchanges
+        for exchange in reversed(self.history):
+            if tokens_in_recent + exchange["tokens"] <= tokens_to_keep:
+                recent_exchanges.insert(0, exchange)
+                tokens_in_recent += exchange["tokens"]
+            else:
+                break
+        
+        # If no recent exchanges fit, keep at least the most recent one
+        if not recent_exchanges and self.history:
+            recent_exchanges = [self.history[-1]]
+        
+        # The rest needs to be summarized
+        exchanges_to_summarize = self.history[:-len(recent_exchanges)] if recent_exchanges else self.history
+        
+        if not exchanges_to_summarize:
+            return  # Nothing to summarize
+            
+        # Create summarization prompt
+        conversation_text = ""
+        for exchange in exchanges_to_summarize:
+            conversation_text += f"User: {exchange['query']}\n"
+            conversation_text += f"Assistant: {exchange['response']}\n\n"
+        
+        prompt = f"""
+        Please provide a concise summary of the following conversation between a user and an AI assistant.
+        Capture the main topics discussed, key questions asked, and important information provided.
+        Focus on retaining factual content and context that would be important for continuing the conversation.
+        
+        CONVERSATION:
+        {conversation_text}
+        
+        SUMMARY:
+        """
+        
+        # Perform the summarization using the OpenAI API
+        try:
+            # Use the global Azure client
+            if _azure_client is not None:
+                response = _azure_client.chat.completions.create(
+                    model=self.summarization_model or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4"),
+                    messages=[{"role": "system", "content": "You are a helpful assistant that summarizes conversations. MAkE SURE TO KEEP ALL USEFULL STUFF IN THE SUMMARRY"},
+                             {"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=1500
+                )
+                
+                summary_text = response.choices[0].message.content
+                
+                # Add the summary to our list of summaries
+                summary_tokens = len(self.tokenizer.encode(summary_text))
+                self.summaries.append({
+                    "timestamp": datetime.datetime.now(),
+                    "summary": summary_text,
+                    "tokens": summary_tokens,
+                    "exchanges_summarized": len(exchanges_to_summarize)
+                })
+                
+                # Replace the history with summary + recent exchanges
+                self.history = [{
+                    "timestamp": datetime.datetime.now(),
+                    "query": "Previous conversation summary",
+                    "response": summary_text,
+                    "tokens": summary_tokens,
+                    "is_summary": True
+                }] + recent_exchanges
+                
+                # Recalculate token count
+                self.current_token_count = summary_tokens + tokens_in_recent
+                
+                logger.info(f"Conversation history summarized. New token count: {self.current_token_count}")
+                
+            else:
+                logger.warning("Summarization attempted but Azure client is not initialized")
+        except Exception as e:
+            logger.error(f"Error summarizing conversation history: {e}")
+    
+    def get_history(self) -> List[Dict[str, Any]]:
+        """
+        Get the full conversation history.
+        
+        Returns:
+            List of dicts containing timestamp, query, and response
+        """
+        return self.history
+    
+    def get_latest_exchange(self) -> Optional[Dict[str, Any]]:
+        """
+        Get the most recent conversation exchange.
+        
+        Returns:
+            Dict with timestamp, query, and response, or None if history is empty
+        """
+        if self.history:
+            return self.history[-1]
+        return None
+    
+    def get_token_count(self) -> int:
+        """
+        Get the current token count for the conversation history.
+        
+        Returns:
+            Current number of tokens in the conversation history
+        """
+        return self.current_token_count
+    
+    def get_summaries(self) -> List[Dict[str, Any]]:
+        """
+        Get all historical summaries that have been generated.
+        
+        Returns:
+            List of summary records with timestamp and summary text
+        """
+        return self.summaries
+    
+    def force_summarize(self) -> bool:
+        """
+        Force summarization of conversation history regardless of token count.
+        
+        Returns:
+            True if summarization was successful, False otherwise
+        """
+        try:
+            self._summarize_history()
+            return True
+        except Exception as e:
+            logger.error(f"Error during forced summarization: {e}")
+            return False
+    
+    def add_handoff(self, from_agent: str, to_agent: str) -> None:
+        """
+        Record a handoff between agents.
+        
+        Args:
+            from_agent: Name of the agent handing off
+            to_agent: Name of the agent receiving the handoff
+        """
+        timestamp = datetime.datetime.now()
+        self.handoffs.append({
+            "timestamp": timestamp,
+            "from_agent": from_agent,
+            "to_agent": to_agent
+        })
+    
+    def get_handoffs(self) -> List[Dict[str, Any]]:
+        """
+        Get all recorded handoffs.
+        
+        Returns:
+            List of handoff events with timestamp, from_agent, and to_agent
+        """
+        return self.handoffs
+    
+    def record_tool_execution(self, tool_name: str, inputs: Dict[str, Any], result: Any) -> None:
+        """
+        Record the execution of a tool.
+        
+        Args:
+            tool_name: Name of the tool
+            inputs: Tool input arguments
+            result: Result returned by the tool
+        """
+        timestamp = datetime.datetime.now()
+        self.tool_executions.append({
+            "timestamp": timestamp,
+            "tool_name": tool_name,
+            "inputs": inputs,
+            "result": result
+        })
+    
+    def set_metadata(self, key: str, value: Any) -> None:
+        """
+        Store arbitrary metadata in the context.
+        
+        Args:
+            key: Metadata key
+            value: Metadata value
+        """
+        self.metadata[key] = value
+    
+    def get_metadata(self, key: str, default: Any = None) -> Any:
+        """
+        Retrieve metadata from the context.
+        
+        Args:
+            key: Metadata key
+            default: Default value if key doesn't exist
+            
+        Returns:
+            The stored value or the default
+        """
+        return self.metadata.get(key, default)
+    
+    def clear_history(self) -> None:
+        """Clear the conversation history."""
+        self.history = []
+    
+    def get_session_duration(self) -> datetime.timedelta:
+        """Get the duration of the current session."""
+        return datetime.datetime.now() - self.session_start
+    
+    def save_to_file(self, filepath: str) -> None:
+        """
+        Save the context data to a JSON file.
+        
+        Args:
+            filepath: Path where to save the file
+        """
+        # Convert data to serializable format
+        data = {
+            "history": [
+                {
+                    "timestamp": h["timestamp"].isoformat(),
+                    "query": h["query"],
+                    "response": h["response"],
+                    "tokens": h.get("tokens", 0),
+                    "is_summary": h.get("is_summary", False)
+                } for h in self.history
+            ],
+            "summaries": [
+                {
+                    "timestamp": s["timestamp"].isoformat(),
+                    "summary": s["summary"],
+                    "tokens": s["tokens"],
+                    "exchanges_summarized": s["exchanges_summarized"]
+                } for s in self.summaries
+            ],
+            "handoffs": [
+                {
+                    "timestamp": h["timestamp"].isoformat(),
+                    "from_agent": h["from_agent"],
+                    "to_agent": h["to_agent"]
+                } for h in self.handoffs
+            ],
+            "tool_executions": [
+                {
+                    "timestamp": t["timestamp"].isoformat(),
+                    "tool_name": t["tool_name"],
+                    "inputs": t["inputs"],
+                    "result": str(t["result"])  # Convert result to string for safe serialization
+                } for t in self.tool_executions
+            ],
+            "metadata": self.metadata,
+            "session_start": self.session_start.isoformat(),
+            "saved_at": datetime.datetime.now().isoformat(),
+            "current_token_count": self.current_token_count,
+            "max_tokens": self.max_tokens,
+            "tokenizer_name": self.tokenizer_name
+        }
+        
+        # Save to file
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+    
+    @classmethod
+    def load_from_file(cls, filepath: str) -> 'BaseContext':
+        """
+        Load context data from a JSON file.
+        
+        Args:
+            filepath: Path to the saved context file
+            
+        Returns:
+            A new BaseContext instance with the loaded data
+        """
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+        
+        # Create context with the same settings
+        context = cls(
+            max_tokens=data.get("max_tokens", 30000),
+            tokenizer_name=data.get("tokenizer_name", "cl100k_base"),
+            auto_summarize=True
+        )
+        
+        # Set the token count directly
+        context.current_token_count = data.get("current_token_count", 0)
+        
+        # Parse ISO timestamps back to datetime
+        for h in data.get("history", []):
+            context.history.append({
+                "timestamp": datetime.datetime.fromisoformat(h["timestamp"]),
+                "query": h["query"],
+                "response": h["response"],
+                "tokens": h.get("tokens", 0),
+                "is_summary": h.get("is_summary", False)
+            })
+        
+        for s in data.get("summaries", []):
+            context.summaries.append({
+                "timestamp": datetime.datetime.fromisoformat(s["timestamp"]),
+                "summary": s["summary"],
+                "tokens": s["tokens"],
+                "exchanges_summarized": s["exchanges_summarized"]
+            })
+            
+        for h in data.get("handoffs", []):
+            context.handoffs.append({
+                "timestamp": datetime.datetime.fromisoformat(h["timestamp"]),
+                "from_agent": h["from_agent"],
+                "to_agent": h["to_agent"]
+            })
+            
+        for t in data.get("tool_executions", []):
+            context.tool_executions.append({
+                "timestamp": datetime.datetime.fromisoformat(t["timestamp"]),
+                "tool_name": t["tool_name"],
+                "inputs": t["inputs"],
+                "result": t["result"]  # Stored as string
+            })
+            
+        context.metadata = data.get("metadata", {})
+        context.session_start = datetime.datetime.fromisoformat(data.get("session_start", context.session_start.isoformat()))
+        
+        return context
+
 # Custom RunHooks for handoff notification
 class HandoffNotificationHooks(RunHooks):
     """Built-in hooks that notify when a handoff occurs."""
@@ -78,7 +508,13 @@ class HandoffNotificationHooks(RunHooks):
         
         # If the context has an add_handoff method, use it to track handoffs
         if hasattr(context.context, 'add_handoff'):
-            context.context.add_handoff(from_agent.name, to_agent.name)
+            # First check if it's our BaseContext (or subclass)
+            if isinstance(context.context, BaseContext):
+                # Use new format with context tracking
+                context.context.add_handoff(from_agent.name, to_agent.name)
+            else:
+                # Traditional context with simple tuple tracking
+                context.context.add_handoff(from_agent.name, to_agent.name)
 
 # Initialize Azure OpenAI client
 try:
@@ -586,15 +1022,90 @@ def run(agent: Agent, user_input: str, context: Any = None) -> Any:
     Returns:
         The result of running the agent
     """
-    kwargs = {}
-    if context is not None:
-        kwargs["context"] = context
-    
-    # Add handoff notification hooks
-    hooks = kwargs.get("hooks", HandoffNotificationHooks())
-    kwargs["hooks"] = hooks
-    
-    return Runner.run_sync(agent, user_input, **kwargs)
+    # Simple solution: add conversation history directly to the prompt
+    if context is not None and hasattr(context, 'history') and context.history:
+        # Check if we should summarize first (either based on tokens or number of exchanges)
+        token_limit = 25000  # Conservative limit to avoid hitting context windows
+        total_tokens = 0
+        
+        # Calculate total tokens from history
+        for entry in context.history:
+            if isinstance(entry, dict) and 'tokens' in entry:
+                total_tokens += entry.get('tokens', 0)
+        
+        # If we're approaching the token limit or have too many exchanges, consider summarizing
+        if total_tokens > token_limit or len(context.history) > 10:
+            logger.info(f"Large conversation detected: {total_tokens} tokens, {len(context.history)} exchanges")
+            
+            # If context has summarization method, use it
+            if hasattr(context, '_summarize_history') and callable(getattr(context, '_summarize_history')):
+                logger.info("Summarizing conversation history before continuing")
+                context._summarize_history()
+        
+        # Build conversation history as markdown
+        conversation_summary = "## CONVERSATION HISTORY (ALWAYS REFERENCE THIS IN YOUR RESPONSE):\n\n"
+        
+        # Check if there are summaries to include
+        if hasattr(context, 'summaries') and context.summaries:
+            # Include the most recent summary
+            latest_summary = context.summaries[-1]
+            conversation_summary += f"**Summary of Previous Conversation**: {latest_summary.get('summary', 'Previous conversation available.')}\n\n"
+            conversation_summary += "---\n\n"
+        
+        # Include conversation entries
+        for i, entry in enumerate(context.history):
+            if isinstance(entry, dict):
+                # Skip entries that are marked as summaries
+                if entry.get('is_summary', False):
+                    conversation_summary += f"**Previous Conversation Summary**: {entry.get('response', '')}\n\n"
+                    conversation_summary += "---\n\n"
+                    continue
+                    
+                conversation_summary += f"**User**: {entry.get('query', '')}\n\n"
+                conversation_summary += f"**Assistant**: {entry.get('response', '')}\n\n"
+                conversation_summary += "---\n\n"
+            elif isinstance(entry, tuple) and len(entry) == 2:
+                conversation_summary += f"**User**: {entry[0]}\n\n"
+                conversation_summary += f"**Assistant**: {entry[1]}\n\n"
+                conversation_summary += "---\n\n"
+                
+        # Add clear instruction to reference the history
+        conversation_summary += "## CURRENT QUERY (RESPOND TO THIS WHILE REFERENCING INFORMATION FROM THE HISTORY ABOVE):\n\n"
+        
+        # Modify user input to include the conversation history
+        enhanced_input = f"{conversation_summary}{user_input}"
+        
+        # Log what we're doing
+        logger.info(f"Enhanced query with conversation history ({len(context.history)} previous exchanges)")
+        
+        # Run with the enhanced input
+        kwargs = {}
+        # Add handoff notification hooks - still need this for handoffs to work
+        hooks = HandoffNotificationHooks()
+        kwargs["hooks"] = hooks
+        
+        # Run with the enhanced input while preserving hooks
+        result = Runner.run_sync(agent, enhanced_input, **kwargs)
+        
+        # Update the context with the interaction
+        if hasattr(context, 'add_to_history'):
+            context.add_to_history(user_input, result.final_output)
+            
+        return result
+    else:
+        # No history, just run normally
+        kwargs = {}
+        # Add handoff notification hooks - still need this for handoffs to work
+        hooks = HandoffNotificationHooks()
+        kwargs["hooks"] = hooks
+        
+        result = Runner.run_sync(agent, user_input, **kwargs)
+        
+        # Update the context if available
+        if context is not None and hasattr(context, 'add_to_history'):
+            context.add_to_history(user_input, result.final_output)
+            
+        return result
 
 # For backwards compatibility
 run_sync = run
@@ -1127,7 +1638,8 @@ __all__ = [
     'ModelSettings',
     'AgentHooks',
     'RunHooks',
-    'ToolDefinition'
+    'ToolDefinition',
+    'BaseContext'
 ]
 
 # New simple function to create an agent with all capabilities in one go
@@ -1195,9 +1707,60 @@ def create_agent(
     
     # Prepare instruction modifications if chain of thought is enabled
     final_instructions = instructions
+    
+    # Add built-in handoffs and tools guidance to all agents
+    handoff_guidance = ""
+    
+    # Only add handoff guidance if there are handoffs
+    if handoffs:
+        # Create a list of available handoff descriptions for the prompt
+        handoff_descriptions = []
+        for h in handoffs:
+            if isinstance(h, Handoff):
+                tool_name = getattr(h, "tool_name", "specialized agent")
+                tool_desc = getattr(h, "tool_description", "specialized tasks")
+                handoff_descriptions.append(f"- {tool_name}: {tool_desc}")
+            elif isinstance(h, Agent):
+                h_name = h.name
+                h_desc = getattr(h, "handoff_description", f"specialized in {h_name.lower()} tasks")
+                handoff_descriptions.append(f"- {h_name}: {h_desc}")
+        
+        # Create the handoff guidance text
+        if handoff_descriptions:
+            handoff_guidance = f"""
+HANDOFF GUIDANCE:
+You have access to specialized agents who are experts in specific domains. ALWAYS hand off to these specialists when a query falls within their expertise:
+
+{chr(10).join(handoff_descriptions)}
+
+When deciding whether to use a handoff:
+1. FIRST evaluate if the query involves specialized knowledge within any of these domains
+2. If it does, you MUST use the appropriate handoff EVEN IF you think you can answer it
+3. Do not attempt to solve specialized problems yourself when a more qualified agent is available
+4. The purpose of handoffs is to provide users with the highest quality expertise
+
+"""
+
+    # Add tool usage guidance
+    tools_guidance = ""
+    if tools_list:
+        tools_guidance = """
+TOOL USAGE GUIDANCE:
+You have access to various tools to help solve problems. Always:
+1. Identify when a tool would be useful for answering a query
+2. Use the most appropriate tool for the specific task
+3. Interpret tool results accurately and include them in your response
+4. Don't hesitate to use multiple tools if necessary to provide a complete answer
+"""
+
+    # Combine all guidance into the final instructions
+    if handoff_guidance or tools_guidance:
+        final_instructions = f"{instructions}\n\n{handoff_guidance}{tools_guidance}".strip()
+    
+    # Add chain of thought guidance if enabled
     if use_chain_of_thought:
         final_instructions = f"""
-{instructions}
+{final_instructions}
 
 When solving problems or responding to complex queries, please think through your reasoning step by step:
 
