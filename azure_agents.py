@@ -211,7 +211,7 @@ class BaseContext:
             # Use the global Azure client
             if _azure_client is not None:
                 response = _azure_client.chat.completions.create(
-                    model=self.summarization_model or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4"),
+                    model=self.summarization_model or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o"),
                     messages=[{"role": "system", "content": "You are a helpful assistant that summarizes conversations. MAkE SURE TO KEEP ALL USEFULL STUFF IN THE SUMMARRY"},
                              {"role": "user", "content": prompt}],
                     temperature=0.3,
